@@ -18,6 +18,13 @@ is_debug = false
 is_official_build = false
 is_component_build = false
 
+# Keep CI builds small and fast: no debug symbols, no PGO/LTO (is_official_build
+# = false already excludes those). Saves ~30-60 GB of out/ disk and hours.
+# Comment out if you need debug symbols locally.
+symbol_level = 0
+v8_symbol_level = 0
+blink_symbol_level = 0
+
 # ---- Desktop-Android extension support (upstream experimental platform,
 # https://crbug.com/356905053) -----------------------------------------------
 #
