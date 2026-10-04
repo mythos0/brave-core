@@ -1,0 +1,278 @@
+# Brave Android (extension support) — build, smoke test & release pipeline.
+#
+# WHAT THIS DOES
+#   1. Preflight: verifies the runner can hold a Chromium-based build
+#      (>= 260 GB free disk, >= 16 GB RAM). Fails fast with a clear message
+#      otherwise — a standard free `ubuntu-latest` runner (14 GB disk) will
+#      ALWAYS fail preflight by design.
+#   2. Build: syncs chromium at the ref pinned in brave-core/package.json,
+#      applies Brave patches, writes the desktop-android-extensions GN args,
+#      and builds the `brave` target (out/Android/apks/Brave*.apk).
+#   3. Smoke test: aapt2 badging, debug-sign + apksigner verify, dex/native
+#      library sanity checks. (An optional emulator boot test can be enabled
+#      via the run_emulator_test input on runners that provide KVM.)
+#   4. Release: creates a (draft) GitHub release and uploads the APK.
+#
+# RUNNER REQUIREMENTS (pick ONE):
+#   * Self-hosted runner label (recommended): >= 16 cores, >= 32 GB RAM,
+#     >= 300 GB free SSD. Register it and pass its label in the `runner`
+#     input.
+#   * GitHub paid larger runner, e.g. `ubuntu-24.04` XL sizes (Team/Enterprise
+#     plans). Standard free runners cannot fit the chromium checkout.
+#
+# First run duration: roughly 2-6 hours depending on cores (gclient sync is
+# bandwidth bound; the C++ build dominates after that).
+
+name: Android APK build + smoke test + release
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner label (self-hosted or larger runner with >=300GB disk)'
+        required: false
+        default: 'ubuntu-latest'
+      release_tag:
+        description: 'Release tag to create (default: android-extensions-v0.1.0)'
+        required: false
+        default: 'android-extensions-v0.1.0'
+      draft_release:
+        description: 'Create the release as a draft (review before publishing)'
+        type: boolean
+        required: false
+        default: true
+      run_emulator_test:
+        description: 'Boot the APK on an Android emulator (needs KVM on runner)'
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: android-ext-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    name: Preflight (disk/RAM requirements)
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    steps:
+      - name: Check build machine requirements
+        shell: bash
+        run: |
+          set -euo pipefail
+          FREE_GB=$(df -BG --output=avail . | tail -1 | tr -dc '0-9')
+          RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
+          CORES=$(nproc)
+          echo "Runner: $(uname -m), free disk ${FREE_GB} GB, RAM ${RAM_GB} GB, cores ${CORES}"
+          if [ "${FREE_GB}" -lt 260 ]; then
+            echo "::error::This runner has only ${FREE_GB} GB free disk. A brave-core (Chromium) Android build needs >= 260 GB."
+            echo "::error::Re-run this workflow with the 'runner' input pointed at a self-hosted or larger (paid) runner."
+            exit 1
+          fi
+          if [ "${RAM_GB}" -lt 15 ]; then
+            echo "::error::This runner has ${RAM_GB} GB RAM; >= 16 GB is required for linking."
+            exit 1
+          fi
+          echo "Requirements satisfied. Proceeding."
+
+  build:
+    name: Build Brave Android APK (extensions enabled)
+    needs: preflight
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 480
+    steps:
+      - name: Checkout brave-core (this fork)
+        uses: actions/checkout@v4
+        with:
+          path: brave-core
+
+      - name: System dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git python3 python3-venv python3-pip curl ca-certificates \
+            openjdk-17-jdk lsb-release wget software-properties-common \
+            libnss3-dev fontconfig
+          sudo snap remove dotnet-sdk-8.0 2>/dev/null || true
+          # Free extra disk: pre-installed toolchains we don't need
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc 2>/dev/null || true
+          echo "JDK:"
+          java -version
+
+      - name: Install Node 24 + pnpm (brave-core devEngines requirement)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.16.0'
+
+      - name: Install depot_tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Sync (chromium + brave vendor deps + patch application)
+        working-directory: brave-core
+        shell: bash
+        env:
+          # Keep gclient history shallow to save disk.
+          GCLIENT_CACHE: true
+        run: |
+          set -euo pipefail
+          corepack enable pnpm 2>/dev/null || npm i -g pnpm@11
+          pnpm --version
+          # Fetches chromium at the tag pinned in package.json
+          # (config.projects.chrome.tag), then applies brave-core patches.
+          pnpm run init --target_os=android --target_arch=arm64
+
+      - name: Write GN args (desktop-android extensions enabled)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/Android
+          cp brave-core/build/android/extensions/args.gn out/Android/args.gn
+          cat out/Android/args.gn
+
+      - name: Generate build files (gn gen)
+        working-directory: brave-core
+        shell: bash
+        run: |
+          set -euo pipefail
+          vendor/depot_tools/gn gen out/Android
+          vendor/depot_tools/gn ls out/Android //brave/build/android:brave >/dev/null \
+            || { echo "::error::brave target missing after gn gen"; exit 1; }
+
+      - name: Build (ninja brave)
+        working-directory: brave-core
+        shell: bash
+        run: |
+          set -euo pipefail
+          vendor/depot_tools/ninja -C out/Android brave -j"$(nproc)"
+
+      - name: Locate and stage APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=$(ls -S brave-core/out/Android/apks/Brave*.apk 2>/dev/null | head -1) \
+            || { echo "::error::No Brave*.apk produced"; ls -R brave-core/out/Android/apks || true; exit 1; }
+          echo "APK=$APK" >> "$GITHUB_ENV"
+          ls -lh "$APK"
+          mkdir -p artifacts
+          cp "$APK" "artifacts/brave-android-extensions-arm64.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: brave-android-extensions-apk
+          path: artifacts/brave-android-extensions-arm64.apk
+          retention-days: 14
+
+  smoke-test:
+    name: Smoke test APK
+    needs: build
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    steps:
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: brave-android-extensions-apk
+          path: .
+
+      - name: Install Android build-tools for aapt2/apksigner
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends unzip wget
+          mkdir -p "$HOME/android-tools" && cd "$HOME/android-tools"
+          URL=$(curl -s https://dl.google.com/android/repository/repository2-3.xml | \
+            grep -o 'build-tools_r34-linux.zip' | head -1 || true)
+          wget -q "https://dl.google.com/android/repository/build-tools_r34-linux.zip"
+          unzip -q build-tools_r34-linux.zip
+          echo "$HOME/android-tools/android-14" >> "$GITHUB_PATH"
+
+      - name: Package inspection (aapt2 badging)
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=brave-android-extensions-arm64.apk
+          aapt2 dump badging "$APK" | tee badging.txt
+          grep -q "package: name='com.brave.browser'" badging.txt \
+            || { echo "::error::Unexpected package name"; exit 1; }
+          grep -q "arm64-v8a" badging.txt || { echo "::error::Missing arm64 libs"; exit 1; }
+          echo "Badging OK."
+
+      - name: Debug-sign and verify signature (apksigner)
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=brave-android-extensions-arm64.apk
+          keytool -genkeypair -v -keystore debug.keystore -storepass android \
+            -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 \
+            -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          cp "$APK" signed.apk
+          apksigner sign --ks debug.keystore --ks-pass pass:android \
+            --key-pass pass:android --out signed.apk signed.apk
+          apksigner verify --verbose signed.apk | tee verify.txt
+          grep -q "Verified using v2 scheme" verify.txt || grep -q "Verified using v3 scheme" verify.txt
+
+      - name: APK content sanity checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=brave-android-extensions-arm64.apk
+          SIZE_MB=$(( $(stat -c%s "$APK") / 1024 / 1024 ))
+          echo "APK size: ${SIZE_MB} MB"
+          [ "$SIZE_MB" -gt 40 ] || { echo "::error::APK suspiciously small"; exit 1; }
+          unzip -l "$APK" | grep -q "classes.dex" || { echo "::error::No dex"; exit 1; }
+          unzip -l "$APK" | grep -q "lib/arm64-v8a/libchrome.so" \
+            || { echo "::error::Missing libchrome.so (native layer)"; exit 1; }
+          # Extensions UI classes must be in the dex (flag-gated java layer)
+          unzip -p "$APK" classes*.dex | strings | grep -q "ExtensionsManager" \
+            || { echo "::error::ExtensionsManager missing from dex — extension java layer not compiled in?"; exit 1; }
+          echo "APK content checks OK."
+
+      - name: Emulator boot test (optional)
+        if: ${{ inputs.run_emulator_test }}
+        continue-on-error: true
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          script: |
+            adb install -r brave-android-extensions-arm64.apk
+            adb shell pm list packages | grep com.brave.browser
+            adb shell monkey -p com.brave.browser -c android.intent.category.LAUNCHER 1
+            sleep 20
+            adb shell dumpsys activity activities | grep -i "com.brave.browser" | head -5
+
+  release:
+    name: Create GitHub release with APK
+    needs: [build, smoke-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: brave-android-extensions-apk
+          path: .
+
+      - name: Create draft release and upload APK
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.release_tag || 'android-extensions-v0.1.0' }}"
+          gh release create "$TAG" \
+            --draft=${{ inputs.draft_release && 'true' || 'false' }} \
+            --title "Brave Android with extension support ($TAG)" \
+            --notes "Automated build of the android-extension-support branch.
+
+          * Base: brave-core master + desktop-android extension scaffolding
+          * GN: enable_desktop_android_extensions=true (arm64)
+          * Signature: debug key (for testing only — re-sign before daily use)
+          * Smoke tested: aapt2 badging, apksigner verify, dex/native checks" \
+            brave-android-extensions-arm64.apk#brave-android-extensions-arm64.apk
