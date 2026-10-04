@@ -578,3 +578,18 @@ brave_java_base_module_deps = [
 ]
 
 brave_java_base_module_deps += brave_java_base_module_billing_deps
+
+# Desktop-Android extension support: Java UI layer for installing and
+# managing browser extensions. The native side lives in
+# brave/browser/android/extensions/ and is gated on enable_extensions_core;
+# keep both gates in sync.
+import("//extensions/buildflags/buildflags.gni")
+
+if (enable_desktop_android_extensions) {
+  brave_java_sources += [
+    "../../brave/android/java/org/chromium/chrome/browser/extensions/ExtensionActionController.java",
+    "../../brave/android/java/org/chromium/chrome/browser/extensions/ExtensionInfo.java",
+    "../../brave/android/java/org/chromium/chrome/browser/extensions/ExtensionInstallActivity.java",
+    "../../brave/android/java/org/chromium/chrome/browser/extensions/ExtensionsManager.java",
+  ]
+}

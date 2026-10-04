@@ -5,6 +5,7 @@
 
 import("//brave/build/config.gni")
 import("//brave/components/brave_ads/buildflags/buildflags.gni")
+import("//extensions/buildflags/buildflags.gni")
 
 assert(is_android)
 
@@ -62,6 +63,37 @@ source_set("android_browser_process") {
     deps += [
       "//brave/browser/brave_ads/android:jni_headers",
       "//brave/components/brave_ads/browser",
+    ]
+  }
+
+  if (enable_extensions_core) {
+    deps += [ ":extensions_android" ]
+  }
+}
+
+# Native bridge for Brave's Android extension support
+# (org.chromium.chrome.browser.extensions.*). Built only when the extensions
+# core is part of the build — desktop, or Android builds made with
+# enable_desktop_android_extensions = true.
+if (enable_extensions_core) {
+  source_set("extensions_android") {
+    sources = [
+      "extensions/extensions_manager_android.cc",
+      "extensions/extensions_manager_android.h",
+    ]
+
+    # NOTE: prune/adjust these deps during the first real desktop-android
+    # build; the upstream experimental platform (crbug.com/356905053) is
+    # still evolving its target boundaries.
+    deps = [
+      "//base",
+      "//chrome/android:jni_headers",
+      "//chrome/browser:browser",
+      "//chrome/browser/extensions",
+      "//components/crx_file",
+      "//content/public/browser",
+      "//extensions/browser",
+      "//extensions/common",
     ]
   }
 }
