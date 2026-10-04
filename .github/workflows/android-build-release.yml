@@ -14,11 +14,30 @@
 #   4. Release: creates a (draft) GitHub release and uploads the APK.
 #
 # RUNNER REQUIREMENTS (pick ONE):
-#   * Self-hosted runner label (recommended): >= 16 cores, >= 32 GB RAM,
-#     >= 300 GB free SSD. Register it and pass its label in the `runner`
-#     input.
-#   * GitHub paid larger runner, e.g. `ubuntu-24.04` XL sizes (Team/Enterprise
-#     plans). Standard free runners cannot fit the chromium checkout.
+#   * Self-hosted runner (FREE, recommended): any Linux x86_64 box with
+#     >= 8 cores (16+ better), >= 32 GB RAM, >= 300 GB free SSD.
+#     Repo Settings -> Actions -> Runners -> New self-hosted runner, register
+#     it with a label (e.g. brave-android-build), then pass that label in the
+#     `runner` input. No 6-hour job cap on self-hosted runners, and the work
+#     dir persists, so rebuilds are much faster than the first run.
+#   * Paid GitHub larger runner: 16-core (~$2/h) or 32-core (~$4/h) Linux.
+#     NOTE: requires a Team/Enterprise plan + billing; free minutes do NOT
+#     apply. GitHub-hosted jobs are hard-capped at 6 h, so prefer 32-core
+#     for a cold build (~2.5-3.5 h). GitHub does not publish disk sizes for
+#     larger runners, so run this workflow ONCE with preflight_only=true on
+#     the label first — it costs cents and verifies disk/RAM/cores.
+#   * Third-party Actions-compatible runners (Depot, Buildjet, Namespace,
+#     WarpBuild): work on free personal accounts, per-minute billing — just
+#     put their label in the `runner` input.
+#
+# WHY FREE STANDARD RUNNERS CAN NEVER WORK (this is structural, not a
+# conservative check):
+#   - Disk: ubuntu-latest shows ~87 GB free (~110-115 GB after the cleanup
+#     step). A slim brave-android build peaks ~100-110 GB (checkout ~60 GB
+#     + out ~35 GB); default args with symbols/LTO peak ~260 GB. No headroom.
+#   - Time (the absolute killer): GitHub-hosted jobs are capped at 6 h.
+#     A cold compile on the 4-core free runner takes 12-20+ h. Caching can't
+#     fix it: the GHA cache is 10 GB/repo, far too small for out/.
 #
 # First run duration: roughly 2-6 hours depending on cores (gclient sync is
 # bandwidth bound; the C++ build dominates after that).
@@ -29,9 +48,18 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: 'Runner label (self-hosted or larger runner with >=300GB disk)'
+        description: 'Runner label (self-hosted w/ 300GB+ disk, or paid larger runner)'
         required: false
         default: 'ubuntu-latest'
+      preflight_only:
+        description: 'Probe mode: check runner disk/RAM/cores then stop (cheap label test)'
+        type: boolean
+        required: false
+        default: false
+      min_disk_gb:
+        description: 'Minimum free disk in GB (slim build peaks ~150; default check 200)'
+        required: false
+        default: '200'
       release_tag:
         description: 'Release tag to create (default: android-extensions-v0.1.0)'
         required: false
@@ -64,9 +92,12 @@ jobs:
           RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
           CORES=$(nproc)
           echo "Runner: $(uname -m), free disk ${FREE_GB} GB, RAM ${RAM_GB} GB, cores ${CORES}"
-          if [ "${FREE_GB}" -lt 260 ]; then
-            echo "::error::This runner has only ${FREE_GB} GB free disk. A brave-core (Chromium) Android build needs >= 260 GB."
-            echo "::error::Re-run this workflow with the 'runner' input pointed at a self-hosted or larger (paid) runner."
+          MIN_GB="${{ inputs.min_disk_gb || '200' }}"
+          if [ "${FREE_GB}" -lt "${MIN_GB}" ]; then
+            echo "::error::This runner has only ${FREE_GB} GB free disk; this build needs >= ${MIN_GB} GB (slim args peak ~100-110 GB, default args ~260 GB)."
+            echo "::error::Option 1 (free): register a self-hosted runner with >= 300 GB disk and pass its label in the 'runner' input."
+            echo "::error::Option 2 (paid): a larger runner (16/32-core) — first verify its disk cheaply by running this workflow with preflight_only=true."
+            echo "::error::Free ubuntu-latest runners (~87 GB disk, 6 h job cap) can never complete this build."
             exit 1
           fi
           if [ "${RAM_GB}" -lt 15 ]; then
@@ -74,10 +105,14 @@ jobs:
             exit 1
           fi
           echo "Requirements satisfied. Proceeding."
+          if [ "${{ inputs.preflight_only || 'false' }}" = "true" ]; then
+            echo "PREFLIGHT ONLY (probe mode): build / smoke-test / release jobs will be skipped."
+          fi
 
   build:
     name: Build Brave Android APK (extensions enabled)
     needs: preflight
+    if: ${{ inputs.preflight_only != true }}
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 480
     steps:
@@ -171,7 +206,7 @@ jobs:
   smoke-test:
     name: Smoke test APK
     needs: build
-    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest # free runner — expensive big-runner minutes stay reserved for the build job only
     steps:
       - name: Download APK artifact
         uses: actions/download-artifact@v4
@@ -232,7 +267,10 @@ jobs:
             || { echo "::error::ExtensionsManager missing from dex — extension java layer not compiled in?"; exit 1; }
           echo "APK content checks OK."
 
-      - name: Emulator boot test (optional)
+      # NOTE: the built APK is arm64; x86_64 emulators cannot run it unless
+      # the GN args use target_cpu = "x64". Keep this off for arm64 artifacts
+      # (test arm64 on a real device instead).
+      - name: Emulator boot test (optional, requires an x64 build)
         if: ${{ inputs.run_emulator_test }}
         continue-on-error: true
         uses: reactivecircus/android-emulator-runner@v2

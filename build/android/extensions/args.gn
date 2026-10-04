@@ -1,0 +1,47 @@
+# Example GN args for building Brave for Android with desktop-style
+# extension support.
+#
+# Usage:
+#   pnpm run init --target_os=android --target_arch=arm64
+#   mkdir -p out/Android && cp brave/build/android/extensions/args.gn out/Android/args.gn
+#   (edit the file to match your needs, then:)
+#   vendor/depot_tools/gn gen out/Android
+#   vendor/depot_tools/ninja -C out/Android brave
+#   -> APK lands in out/Android/apks/Brave*.apk
+#
+# Alternatively merge the two extension lines into an existing args.gn
+# produced by `pnpm run gn`.
+
+target_os = "android"
+target_cpu = "arm64"
+is_debug = false
+is_official_build = false
+is_component_build = false
+
+# Keep CI builds small and fast: no debug symbols, no PGO/LTO (is_official_build
+# = false already excludes those). Saves ~30-60 GB of out/ disk and hours.
+# Comment out if you need debug symbols locally.
+symbol_level = 0
+v8_symbol_level = 0
+blink_symbol_level = 0
+
+# ---- Desktop-Android extension support (upstream experimental platform,
+# https://crbug.com/356905053) -----------------------------------------------
+#
+# enable_desktop_android_extensions is the actual compile gate for the
+# extensions system on Android (declared in
+# extensions/buildflags/buildflags.gni).
+enable_desktop_android_extensions = true
+
+# is_desktop_android switches the build into the "desktop android" variant
+# (windowing, manifest jinja branches, etc.). Upstream defaults
+# enable_desktop_android_extensions to this value. If your chromium revision
+# errors that is_desktop_android is not a settable arg, remove this line —
+# the explicit enable_desktop_android_extensions above is what matters for
+# compiling the extensions code.
+is_desktop_android = true
+
+# ---- Optional tuning --------------------------------------------------------
+# target_cpu = "x64"          # emulator builds
+# symbol_level = 1            # faster, smaller symbol files
+# brave_android_developer_options_code = ""
